@@ -236,6 +236,9 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 	frontendAttrs := maps.Clone(opt.FrontendAttrs)
 	maps.Copy(frontendAttrs, cacheOpt.frontendAttrs)
 
+	const statusInactivityTimeout = 5 * time.Second
+	statusInactivityTimer := time.NewTimer(statusInactivityTimeout)
+
 	solveCtx, cancelSolve := context.WithCancelCause(ctx)
 	var res *SolveResponse
 	eg.Go(func() error {
@@ -244,8 +247,11 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 
 		defer func() { // make sure the Status ends cleanly on build errors
 			go func() {
-				<-time.After(3 * time.Second)
-				cancelStatus(errors.WithStack(context.Canceled))
+				select {
+				case <-statusContext.Done():
+				case <-statusInactivityTimer.C:
+					cancelStatus(errors.WithStack(context.Canceled))
+				}
 			}()
 			if !opt.SessionPreInitialized {
 				bklog.G(ctx).Debugf("stopping session")
@@ -345,8 +351,13 @@ func (c *Client) solve(ctx context.Context, def *llb.Definition, runGateway runG
 				if errors.Is(err, io.EOF) {
 					return nil
 				}
+				// Ignore context canceled, triggered after inactivity timeout
+				if errors.Is(err, context.Canceled) || statusContext.Err() != nil {
+					return nil
+				}
 				return errors.Wrap(err, "failed to receive status")
 			}
+			statusInactivityTimer.Reset(statusInactivityTimeout)
 			if statusChan != nil {
 				statusChan <- NewSolveStatus(resp)
 			}
